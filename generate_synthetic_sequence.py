@@ -1,84 +1,73 @@
-import torch
-import numpy as np
-import pandas as pd
-from torch import nn
-from typing import List, Optional
-from sklearn.preprocessing import LabelEncoder, StandardScaler   # only for type hints
-
-
 @torch.no_grad()
 def generate_synthetic_sequence(
-    model: nn.Module,
-    initial_lab_values: torch.Tensor,          # 1-D tensor: [num_feats] + [cat_id]
+    model,
+    initial_lab_values: torch.Tensor,   # numericals ⨁ label-encoded categorical id
     num_timesteps: int,
-    lab_columns: List[str],                    # order: all numerical cols, then the categorical col
-    le: LabelEncoder,                          # fitted on the categorical column
-    scaler: Optional[StandardScaler] = None,   # fitted *only* on the numerical columns
+    lab_columns: list[str],
+    le,                                 # fitted LabelEncoder
+    scaler=None,                        # StandardScaler for numericals, or None
 ):
     """
-    Greedy autoregressive generation of `num_timesteps` future lab values.
-
-    * The model is called twice at each step: once in 'numerical' mode and
-      once in 'categorical' mode.
-    * Assumes **one** categorical feature per time-step (the one you
-      label-encoded with `le`).
-    * Returns a DataFrame with columns == `lab_columns` and an extra
-      'avisitn' column (1 … n).
+    Returns a DataFrame with *all* numerical columns first and the single
+    categorical column last, plus 'avisitn'.
     """
     device = next(model.parameters()).device
     initial_lab_values = initial_lab_values.to(device)
 
-    # ------------------------------------------------------------------
-    # 1. Split the baseline vector into numerical and categorical parts
-    # ------------------------------------------------------------------
-    n_num = model.num_numerical_features
-    baseline_num = initial_lab_values[:n_num]               # (n_num,)
-    baseline_cat = initial_lab_values[n_num:].long()        # () or (1,)
+    # ------------------------------------------------------------
+    # 1. split baseline vector into numerical part + one cat id
+    # ------------------------------------------------------------
+    n_num = model.num_numerical_features          # how many numericals
+    base_num = initial_lab_values[:n_num]          # (n_num,)
+    base_cat = initial_lab_values[n_num:].long()   # scalar tensor ()
 
     mask_token_id = le.transform(["[MASK]"])[0]
 
-    baseline_num_mask = ~torch.isnan(baseline_num)          # (n_num,)
-    baseline_cat_mask = baseline_cat != mask_token_id       # (1,)  bool
+    base_num_mask = ~torch.isnan(base_num)         # (n_num,)
+    base_cat_mask = (base_cat != mask_token_id)    # ()
 
-    # ------------------------------------------------------------------
-    # 2. Prepare immutable encoder inputs (batch == 1)
-    # ------------------------------------------------------------------
-    src_num_tensor = baseline_num.unsqueeze(0)              # (1, n_num)
-    src_cat_tensor = baseline_cat.unsqueeze(0).unsqueeze(1) # (1, 1)
+    # ------------------------------------------------------------
+    # 2. build immutable encoder inputs  — shape (1, 1, *)
+    # ------------------------------------------------------------
+    src_num_tensor = base_num.unsqueeze(0)               # (1, n_num)
+    src_cat_tensor = base_cat.view(1, 1, 1)              # (1, 1, 1)
 
-    src_num_mask   = baseline_num_mask.unsqueeze(0)         # (1, n_num)
-    src_cat_mask   = baseline_cat_mask.unsqueeze(0).unsqueeze(1)  # (1, 1)
+    src_num_mask   = base_num_mask.unsqueeze(0)          # (1, n_num)
+    src_cat_mask   = base_cat_mask.view(1, 1, 1)         # (1, 1, 1)
 
-    # ------------------------------------------------------------------
-    # 3. Containers for autoregressive generation
-    # ------------------------------------------------------------------
-    num_tokens   = [baseline_num]           # list[Tensor(n_num,)]
-    cat_tokens   = [baseline_cat]           # list[Tensor(1,)]
+    # ------------------------------------------------------------
+    # 3. containers for the autoregressive loop
+    # ------------------------------------------------------------
+    num_tokens = [base_num]          # list of (n_num,) tensors
+    num_masks  = []
 
-    num_masks    = []
-    cat_masks    = []
+    cat_tokens = [base_cat]          # list of scalar tensors
+    cat_masks  = []
 
-    # ------------------------------------------------------------------
-    # 4. Greedy loop
-    # ------------------------------------------------------------------
+    # ------------------------------------------------------------
+    # 4. greedy generation
+    # ------------------------------------------------------------
     for t in range(num_timesteps):
         # ---------- build decoder inputs ----------
         if t == 0:
-            tgt_num_seq  = baseline_num.unsqueeze(0).unsqueeze(0)     # (1, 1, n_num)
-            tgt_cat_seq  = baseline_cat.unsqueeze(0).unsqueeze(0).unsqueeze(2)  # (1, 1, 1)
+            tgt_num_seq  = base_num.unsqueeze(0).unsqueeze(0)       # (1, 1, n_num)
+            tgt_num_mask = base_num_mask.unsqueeze(0).unsqueeze(0)  # (1, 1, n_num)
 
-            tgt_num_mask = baseline_num_mask.unsqueeze(0).unsqueeze(0)          # (1, 1, n_num)
-            tgt_cat_mask = baseline_cat_mask.unsqueeze(0).unsqueeze(0).unsqueeze(2)  # (1, 1, 1)
+            tgt_cat_seq  = base_cat.view(1, 1, 1)                   # (1, 1, 1)
+            tgt_cat_mask = base_cat_mask.view(1, 1, 1)              # (1, 1, 1)
         else:
-            # stack predictions so far (skip the baseline position 0)
+            # ----- numerical -----
             tgt_num_seq  = torch.stack(num_tokens[1:], dim=0).unsqueeze(0)      # (1, t, n_num)
-            tgt_cat_seq  = torch.stack(cat_tokens[1:], dim=0).unsqueeze(0).unsqueeze(2)  # (1, t, 1)
+            tgt_num_mask = torch.stack(num_masks,  dim=0).unsqueeze(0)           # (1, t, n_num)
 
-            tgt_num_mask = torch.stack(num_masks, dim=0).unsqueeze(0)           # (1, t, n_num)
-            tgt_cat_mask = torch.stack(cat_masks, dim=0).unsqueeze(0).unsqueeze(2)       # (1, t, 1)
+            # ----- categorical  (keep 3-D: add .unsqueeze(-1)) -----
+            cat_tensor  = torch.stack(cat_tokens[1:], dim=0).unsqueeze(-1)       # (t, 1)
+            mask_tensor = torch.stack(cat_masks,  dim=0).unsqueeze(-1)           # (t, 1)
+            tgt_cat_seq  = cat_tensor.unsqueeze(0)                               # (1, t, 1)
+            tgt_cat_mask = mask_tensor.unsqueeze(0)                              # (1, t, 1)
 
         # causal mask for decoder self-attention
-        seq_len = tgt_num_seq.size(1)
+        seq_len = tgt_num_seq.size(1)           # same for cat & num
         causal_mask = None
         if seq_len > 0:
             causal_mask = torch.triu(
@@ -95,10 +84,11 @@ def generate_synthetic_sequence(
             tgt_attn_mask=causal_mask,
             mode="numerical",
         )  # (1, seq_len, n_num)
-        next_num = pred_num[0, -1, :]                   # (n_num,)
+
+        next_num = pred_num[0, -1, :]                # (n_num,)
         next_num = torch.nan_to_num(next_num, nan=0.0)
         num_tokens.append(next_num)
-        num_masks.append(torch.isfinite(next_num))
+        num_masks .append(torch.isfinite(next_num))
 
         # ---------- categorical prediction ----------
         pred_cat_logits = model(
@@ -109,31 +99,28 @@ def generate_synthetic_sequence(
             tgt_attn_mask=causal_mask,
             mode="categorical",
         )  # (1, seq_len, num_categories)
-        next_cat = torch.argmax(pred_cat_logits[0, -1, :]).long()    # ()
+
+        next_cat = torch.argmax(pred_cat_logits[0, -1, :]).long()   # scalar ()
         cat_tokens.append(next_cat)
-        cat_masks.append(next_cat != mask_token_id)
+        cat_masks .append(next_cat != mask_token_id)
 
-    # ------------------------------------------------------------------
-    # 5. Stack generated tokens (drop baseline position 0)
-    # ------------------------------------------------------------------
-    num_seq_tensor = torch.stack(num_tokens[1:], dim=0)              # (n_steps, n_num)
-    cat_seq_tensor = torch.stack(cat_tokens[1:], dim=0)              # (n_steps,)
+    # ------------------------------------------------------------
+    # 5. stack generated tokens (skip baseline position 0)
+    # ------------------------------------------------------------
+    num_seq_tensor = torch.stack(num_tokens[1:], dim=0)           # (n_steps, n_num)
+    cat_seq_tensor = torch.stack(cat_tokens[1:], dim=0)           # (n_steps,)
 
-    # ------------------------------------------------------------------
-    # 6. De-normalise numericals, decode categorical IDs
-    # ------------------------------------------------------------------
+    # ------------- de-normalise & decode ------------------------
     num_np = num_seq_tensor.cpu().numpy()
     if scaler is not None:
-        num_np = scaler.inverse_transform(num_np)                    # (n_steps, n_num)
+        num_np = scaler.inverse_transform(num_np)
 
-    cat_np   = cat_seq_tensor.cpu().numpy().astype(int)              # (n_steps,)
-    cat_text = le.inverse_transform(cat_np)                          # original strings
+    cat_np   = cat_seq_tensor.cpu().numpy().astype(int)
+    cat_text = le.inverse_transform(cat_np)
 
-    # ------------------------------------------------------------------
-    # 7. Assemble the DataFrame
-    # ------------------------------------------------------------------
+    # ------------- assemble DataFrame ---------------------------
     num_cols = lab_columns[:n_num]
-    cat_col  = lab_columns[n_num]      # assumes exactly one categorical column
+    cat_col  = lab_columns[n_num]
 
     df_num = pd.DataFrame(num_np, columns=num_cols)
     df_cat = pd.DataFrame({cat_col: cat_text})
